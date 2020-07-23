@@ -64,6 +64,7 @@ def main(unused_argv: List[str]) -> None:
 
     # Load the snippets from wikipedia
     print(f"Loading dataset 'wiki_dpr' without embeddings...")
+    # 13 GB without the embeddings... I should work remotely?
     wiki_dpr = nlp.load_dataset("wiki_dpr", "psgs_w100_no_embeddings")
     print(f"Done loading dataset 'wiki_dpr'.")
     print("")
@@ -75,7 +76,8 @@ def main(unused_argv: List[str]) -> None:
     print("")
     print(dir(wiki_dpr))
     print("")
-    return 
+    
+
 
     if FLAGS.input_mode == "eli5":
         # Load dataset
