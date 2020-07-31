@@ -1,4 +1,5 @@
 import importlib
+import json
 import types
 from typing import *
 
@@ -9,16 +10,19 @@ def slow_import(module_name: str) -> types.ModuleType:
     return module_
 
 import absl
-import colored_traceback.auto
+from absl import app
+from absl import flags
+
 import click
-import json
+import colored_traceback.auto
+import faiss                   
 import matplotlib.pyplot as plt
 import numpy as np
+import torch # This is just to make sure that pytorch is installed
 nlp = slow_import("nlp")
 transformers = slow_import("transformers")
 import tqdm
 
-flags = absl.flags
 FLAGS = flags.FLAGS
 flags.DEFINE_enum("model", "yjernite/bart_eli5", {"yjernite/bart_eli5",}, 
                   "Model to load using `.from_pretrained`.")
@@ -58,27 +62,26 @@ def main(unused_argv: List[str]) -> None:
     tokenizer = transformers.AutoTokenizer.from_pretrained(FLAGS.model)
 
     # Load the model
-    print(f"Loading model '{FLAGS.model}'...")
-    model = transformers.AutoModelForSeq2SeqLM.from_pretrained(FLAGS.model)
-    print(f"Done loading model '{FLAGS.model}'.")
+    # print(f"Loading model '{FLAGS.model}'...")
+    # model = transformers.AutoModelForSeq2SeqLM.from_pretrained(FLAGS.model)
+    # print(f"Done loading model '{FLAGS.model}'.")
 
     # Load the snippets from wikipedia
-    print(f"Loading dataset 'wiki_dpr' without embeddings...")
-    # 13 GB without the embeddings... I should work remotely?
+    print(f"Loading dataset 'wiki_dpr' without embeddings...")    
     wiki_dpr = nlp.load_dataset("wiki_dpr", "psgs_w100_no_embeddings")
-    print(f"Done loading dataset 'wiki_dpr'.")
-    print("")
-    print(dir(wiki_dpr))
-    print("")
-    print(f"Loading dataset 'wiki_dpr' with embeddings...")
-    wiki_dpr = nlp.load_dataset("wiki_dpr", "psgs_w100_embeddings")
-    print(f"Done loading dataset 'wiki_dpr'.")
-    print("")
-    print(dir(wiki_dpr))
-    print("")
+    # wiki_dpr = nlp.load_dataset("wiki_dpr", "psgs_w100_with_nq_embeddings")
     
-
-
+    print("#" * 80)
+    print(f"Done loading dataset 'wiki_dpr'.")
+    print("")
+    print("dir(wiki_dpr):", dir(wiki_dpr), "\n")
+    print("wiki_dpr['train']:", wiki_dpr["train"], "\n")
+    print("dir(wiki_dpr['train']):", dir(wiki_dpr["train"]), "\n")
+    print("column names", wiki_dpr["train"].column_names, "\n")
+    # print("next iter:", next(iter(wiki_dpr["train"])), "\n")
+    # print("getitem:", wiki_dpr["train"][100], "\n")
+    print("#" * 80)
+        
     if FLAGS.input_mode == "eli5":
         # Load dataset
         print("Loading dataset 'eli5'...")
@@ -96,6 +99,7 @@ def main(unused_argv: List[str]) -> None:
 
         print("\nLabels:")
         print_iterable(answers)
+
     elif FLAGS.input_mode == "cli":
         question = input("Question: ")
     
@@ -115,4 +119,4 @@ def main(unused_argv: List[str]) -> None:
         print("")
 
 if __name__ == "__main__":
-    absl.app.run(main)
+    app.run(main)
