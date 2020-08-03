@@ -1,49 +1,45 @@
-print("Loading package 'nlp'")
+"""Computes different statistics about the dataset.
+"""
+from absl import app
+from absl import flags
 import nlp
-print("Done loading package 'nlp'")
-
-print("Loading package 'transformers'")
 import transformers
-print("Done loading package 'transformers'")
-
 import matplotlib.pyplot as plt
 import numpy as np
 import tqdm
 
-def main():
+flags.DEFINE_string("mode", "facebook/bart-large", "Which model's tokenize to load from Huggingface. Examples: t5-11b, facebook/bart-large")
+flags.DEFINE_integer("maxlen", "1024", "Maximum number of tokens per sample for the encoder, for that model. Examples: 512 for T5, 1024 for BART")
+
+FLAGS = flags.FLAGS
+
+def main(unused_argv):
+    if len(unused_argv) > 1:
+        raise RuntimeError(f"Got unexpectedly unused elements for argv: {unused_argv}")
+        
     ############################################################################
-    # MODE = "str.split"
-    # MAXLEN = 1000
-
-    MODE = "t5-11b"
-    MAXLEN = 512
-    
-    # MODE = "facebook/bart-large"
-    # MAXLEN = 1024
-    ############################################################################
-
-    print("#" * 80)
-    print(f"Mode: {MODE}")
-    print(f"Maxlen: {MAXLEN}")
-    print("#" * 80)
-
     # Build the correct tokenize function
-    if MODE == "str.split":
+    ############################################################################
+    if FLAGS.mode == "str.split":
         tokenize = str.split
     else:
         def from_tokenizer(tokenizer):
             def tokenize(input_text):
                 return tokenizer(input_text)["input_ids"]
             return tokenize
-        tokenizer = transformers.AutoTokenizer.from_pretrained(MODE)
+        tokenizer = transformers.AutoTokenizer.from_pretrained(FLAGS.mode)
         tokenize = from_tokenizer(tokenizer)
 
+    ############################################################################
     # Load dataset
+    ############################################################################
     print("Loading dataset 'eli5'")
     eli5 = nlp.load_dataset("eli5")
     print("Done loading dataset 'eli5'")
 
-    # Count average length
+    ############################################################################
+    # Aggregate stats on lengths
+    ############################################################################
     lengths = []
     print("Counting...")
     # For each dataset entry
@@ -54,12 +50,14 @@ def main():
             length = len(tokenized)
             lengths.append(length)
     
+    ############################################################################
     # Print statistics about the lengths
+    ############################################################################
     lengths = np.array(lengths, dtype=np.int64)
     stddev = np.std(lengths)
     mean = np.mean(lengths)
     median = np.median(lengths)
-    delim_long_answer = MAXLEN
+    delim_long_answer = FLAGS.maxlen
     num_long_answers = np.sum(lengths > delim_long_answer)
     print("\n" * 2 + "#" * 80) 
     print("Stats:")
@@ -73,7 +71,9 @@ def main():
     print(f"qty answers longer than {delim_long_answer}:", num_long_answers)
     print("#" * 80)
 
+    ############################################################################
     # Plot a histogram with the lengths
+    ############################################################################
     # There are a very small number of extremely long answers that
     # mess up the histogram. We remove these.
     cut_down = lengths[lengths <= mean + stddev * 4]
@@ -89,4 +89,4 @@ def main():
     plt.show()
 
 if __name__ == "__main__":
-    main()
+    app.run(main)
