@@ -24,28 +24,35 @@ import torch
 import transformers
 import tqdm
 
+
 CREATE_MEMMAP_BATCH_SIZE = 512
 DPR_EMB_DTYPE = np.float32
 DPR_K = 5
+SAVE_ROOT=pathlib.Path(__file__).parent/"saves"
 
 FLAGS = flags.FLAGS
+# Changes often
+flags.DEFINE_string("faiss_index_factory", None,
+                    "Srting describing the FAISS index.")
 flags.DEFINE_boolean("create_faiss_dpr", True, 
                      "Whether to rebuild DPR's FAISS index")
-flags.DEFINE_boolean("faiss_use_gpu", True, 
-                     "Whether to use the GPU with FAISS.")
 flags.DEFINE_boolean("create_np_memmap", False, 
                      "Whether to rebuild DPR's memmap index")
+flags.DEFINE_enum   ("input_mode", "eli5", {"eli5", "cli"},
+                     "What type of input to use for the question.")
+
+# Doesn't change quite as often
+flags.DEFINE_boolean("faiss_use_gpu", True, 
+                     "Whether to use the GPU with FAISS.")
 flags.DEFINE_enum   ("model", "yjernite/bart_eli5", 
                     {"yjernite/bart_eli5",}, 
                      "Model to load using `.from_pretrained`.")
 flags.DEFINE_integer("log_level", logging.WARNING, 
                      "Logging verbosity.")
-flags.DEFINE_enum   ("input_mode", "eli5", {"eli5", "cli"},
-                     "What type of input to use for the question.")
-flags.DEFINE_string ("dpr_faiss_path", "dpr_faiss.faiss", 
+flags.DEFINE_string ("dpr_faiss_path", SAVE_ROOT/"dpr_faiss.faiss", 
                      "Save path of the FAISS MIPS index with the DPR "
                      "embeddings.")
-flags.DEFINE_string ("dpr_np_memmmap_path", "dpr_np_memmmap.dat", 
+flags.DEFINE_string ("dpr_np_memmmap_path", SAVE_ROOT/"dpr_np_memmap.dat", 
                      "Where to save the memory map of the DPR"
                      " embeddings.")
 
@@ -90,7 +97,7 @@ class ExpRunningAverage:
 # Dense Retriever Namespace
 ################################################################################
 class DenseRetriever:
-    """Namespace with all the functions used for retrieval.
+    """Namespace with the functions used for dense retrieval with FAISS.
     """
     def __init__(self):
         raise RuntimeError("Should never be instantiated.")
@@ -98,14 +105,13 @@ class DenseRetriever:
     @staticmethod
     def create_index(embeddings):
         USE_SUBSET = None
-
-        # TODO: THIS IS JUST DEBUGGING CODE
         if USE_SUBSET is not None:
             print(f">> CAREFUL. Using subset {USE_SUBSET} / {len(embeddings)},"
                   f" {USE_SUBSET/len(embeddings):0.2%}")
             embeddings = embeddings[:USE_SUBSET]
 
-        # Ref: https://github.com/matsui528/faiss_tips
+        # Ref: 
+        # https://github.com/matsui528/faiss_tips
         HNSW_M = 32 # Number of neigbors for HNSW
         NBITS = 8 # Number of bits per subvector
         NLIST = int(math.sqrt(len(embeddings))) 
@@ -113,18 +119,19 @@ class DenseRetriever:
         DIM = embeddings.shape[1]
         NUM_SUBVECTORS = 16
 
-        # print(f"HNSW_M:               {HNSW_M}")
-        # print(f"NBITS:                {NBITS}")
-        # print(f"NLIST:                {NLIST}")
-        # print(f"DIM:                  {DIM}")
-        # print(f"NUM_SUBVECTORS:       {NUM_SUBVECTORS}")
-        # print(f"CUDA_VISIBLE_DEVICES: {os.environ['CUDA_VISIBLE_DEVICES']}")
-
-        quantizer = faiss.IndexHNSWFlat(DIM, HNSW_M)
+        # quantizer = faiss.IndexHNSWFlat(DIM, HNSW_M)
         # quantizer = faiss.IndexFlatIP(DIM)
         # index = faiss.IndexFlatIP(DIM)
         # index = faiss.IndexIVFPQ(quantizer, DIM, NLIST, NUM_SUBVECTORS, NBITS)
-        index = faiss.IndexIVFFlat(quantizer, DIM, NLIST)
+        # index = faiss.IndexIVFFlat(quantizer, DIM, NLIST)
+        # index = faiss.IndexHNSWSQ(DIM, faiss.ScalarQuantizer.QT_8bit, 16)
+
+        # Ref:
+        # https://github.com/facebookresearch/faiss/wiki/Indexing-1G-vectors
+        # index = faiss.index_factory(DIM, "PCAR32,IVF262144_HNSW32,SQfp16")
+        # index = faiss.index_factory(DIM, "PCAR32,IVF65536_HNSW32,SQfp16")
+        index = faiss.index_factory(DIM, FLAGS.faiss_index_factory)
+        
 
         if FLAGS.faiss_use_gpu:
             print("\t- Moving to gpu")
@@ -142,6 +149,8 @@ class DenseRetriever:
         # index.add(embeddings)
         print(f"\t- Adding took "
               f"{tqdm.tqdm.format_interval(time.time() - start)}")
+        
+        
         return index
 
     @staticmethod
@@ -175,8 +184,7 @@ class DenseRetriever:
 def create_memmap(path, dataset, embedding_depth, 
                   num_embeddings, batch_size,
                   np_index_dtype):
-    """
-    Creates the memory mapped array containing the embeddings
+    """Creates the mem-mapped array containing the embeddings for DPR wikipedia.
 
     Modified from 
     https://github.com/huggingface/notebooks/blob/master/longform-qa/lfqa_utils.py#L566    
@@ -236,15 +244,6 @@ def main(unused_argv: List[str]) -> None:
     # wiki_dpr = nlp.load_dataset("wiki_dpr", "psgs_w100_no_embeddings")
     wiki_dpr = nlp.load_dataset("wiki_dpr", "psgs_w100_with_nq_embeddings")
     print(f"Done loading dataset 'wiki_dpr'.")
-
-    # print("#" * 80)
-    # print(f"Done loading dataset 'wiki_dpr'.")
-    # print("")
-    # print("dir(wiki_dpr):", dir(wiki_dpr), "\n")
-    # print("wiki_dpr['train']:", wiki_dpr["train"], "\n")
-    # print("dir(wiki_dpr['train']):", dir(wiki_dpr["train"]), "\n")
-    # print("column names", wiki_dpr["train"].column_names, "\n")
-    # print("#" * 80)
 
 
     ############################################################################
@@ -330,10 +329,10 @@ def main(unused_argv: List[str]) -> None:
         "facebook/dpr-question_encoder-single-nq-base")
     print("... Done loading DPR tokenizer.")
 
-    print("Loading DPR model ...")
+    print("Loading DPR question encoder model ...")
     dpr_model = nlp.AutoModelWithLMHead.from_pretrained(
         "facebook/dpr-question_encoder-single-nq-base")
-    print("... Done loading DPR model.")
+    print("... Done loading DPR question encoder model.")
 
     # Tokenize the question for the DPR encoder
     dpr_tokenized = dpr_tokenizer(question)
