@@ -6,6 +6,7 @@ import os
 import json
 import six
 import sys
+import textwrap
 import time
 import types
 from typing import *
@@ -24,7 +25,8 @@ import torch
 import transformers
 import tqdm
 
-
+ELI5_QUESTION_INDEX = 34 # Max: 272634
+INDEX_NPROBE = 256
 CREATE_MEMMAP_BATCH_SIZE = 512
 DPR_EMB_DTYPE = np.float32
 DPR_K = 5
@@ -49,7 +51,9 @@ flags.DEFINE_enum   ("model", "yjernite/bart_eli5",
                      "Model to load using `.from_pretrained`.")
 flags.DEFINE_integer("log_level", logging.WARNING, 
                      "Logging verbosity.")
-flags.DEFINE_string ("dpr_faiss_path", str(SAVE_ROOT/"PCAR32,IVF262144_HNSW32,SQfp16.faiss"), 
+flags.DEFINE_string ("dpr_faiss_path", 
+                     str(SAVE_ROOT/"PCAR32,IVF262144_HNSW32,SQfp16.faiss"), 
+                    #  str(SAVE_ROOT/"PCAR32,IVF65536_HNSW32,SQfp16.faiss"),
                      "Save path of the FAISS MIPS index with the DPR "
                      "embeddings.")
 flags.DEFINE_string ("dpr_np_memmmap_path", str(SAVE_ROOT/"dpr_np_memmap.dat"), 
@@ -93,6 +97,15 @@ class ExpRunningAverage:
     
         return self.running_average
 
+def get_terminal_width():
+    rows, columns = os.popen('stty size', 'r').read().split()
+    return int(columns)
+
+def wrap(text, joiner, padding=4):
+    wrapped = [line.strip() for line in 
+               textwrap.wrap(text, get_terminal_width() - padding)]
+    return joiner.join(wrapped)
+
 ################################################################################
 # Dense Retriever Namespace
 ################################################################################
@@ -111,7 +124,8 @@ class DenseRetriever:
             embeddings = embeddings[:USE_SUBSET]
 
         DIM = embeddings.shape[1]
-        index = faiss.index_factory(DIM, FLAGS.faiss_index_factory)
+        index = faiss.index_factory(DIM, FLAGS.faiss_index_factory,
+                                    faiss.METRIC_INNER_PRODUCT)
 
         if FLAGS.faiss_use_gpu:
             print("\t- Moving to gpu")
@@ -135,6 +149,9 @@ class DenseRetriever:
 
     @staticmethod
     def search(index, queries, k):
+        # One should be careful about assigning to attributes in Python
+        assert hasattr(index, "nprobe") 
+        index.nprobe = INDEX_NPROBE
         return index.search(queries, k)
 
     @staticmethod
@@ -285,16 +302,18 @@ def main(unused_argv: List[str]) -> None:
         print("Done loading dataset 'eli5'.")
 
         # Attempt to get a prediction
-        sample = eli5["train_eli5"][0]
+        sample = eli5["train_eli5"][ELI5_QUESTION_INDEX]
         question = sample["title"]
 
         check_type(question, str)
         answers = sample["answers"]["text"]
         print("\nQuestion:")
-        print(question)
+        print("   " + question)
 
         print("\nLabels:")
-        print_iterable(answers)
+        for answer in answers:
+            print(" - " + wrap(answer, "\n   ", 3) + "\n")
+        print("")
 
     elif FLAGS.input_mode == "cli":
         question = input("Question: ")
@@ -303,33 +322,37 @@ def main(unused_argv: List[str]) -> None:
     ############################################################################
     # DPR Search
     ############################################################################
-    print("Loading DPR tokenizer ...")
+    # print("Loading DPR tokenizer ...")
     dpr_tokenizer = transformers.DPRQuestionEncoderTokenizer.from_pretrained(
         "facebook/dpr-question_encoder-single-nq-base")
-    print("... Done loading DPR tokenizer.")
+    # print("... Done loading DPR tokenizer.")
 
-    print("Loading DPR question encoder model ...")
+    # print("Loading DPR question encoder model ...")
     dpr_model = transformers.DPRQuestionEncoder.from_pretrained(
         "facebook/dpr-question_encoder-single-nq-base")
-    print("... Done loading DPR question encoder model.")
+    # bert_base = transformers.BertModel.from_pretrained("bert-base-uncased")
+    # dpr_model.question_encoder.bert_model.embeddings.position_ids = (
+    #     bert_base.embeddings.position_ids)
+    # print("... Done loading DPR question encoder model.")
 
     # Tokenize the question for the DPR encoder
     dpr_tokenized = dpr_tokenizer(question, return_tensors="pt")
     
     # Run the DPR encoder to get the embedding key to search FAISS with
-    print("Predicting retrieval embedding ...")
+    # print("Predicting retrieval embedding ...")
     # Ref: 
     # https://huggingface.co/transformers/master/model_doc/dpr.html#dprquestionencoder
     dpr_embedding = dpr_model(**dpr_tokenized)[0]
 
     # Do the FAISS search
-    print("Done predicting retrieval embedding.")
+    # print("Done predicting retrieval embedding.")
     distances, indices = faiss_index_dpr.search(dpr_embedding.detach().numpy(), DPR_K)
-    print("Indices:", indices.shape)
-    print("Text:")
+    # print("Indices:", indices.shape)
+    print("Contexts:\n")
     for index in indices[0]:
-        print(" -", wiki_dpr[index]["text"], "\n")
-    
+        print(" - " + wrap(wiki_dpr["train"][int(index)]["text"], "\n   ", 3) 
+              + "\n")
+
     return 
 
 
