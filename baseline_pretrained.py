@@ -33,8 +33,8 @@ SAVE_ROOT=pathlib.Path(__file__).parent/"saves"
 FLAGS = flags.FLAGS
 # Changes often
 flags.DEFINE_string("faiss_index_factory", None,
-                    "Srting describing the FAISS index.")
-flags.DEFINE_boolean("create_faiss_dpr", True, 
+                    "String describing the FAISS index.")
+flags.DEFINE_boolean("create_faiss_dpr", False, 
                      "Whether to rebuild DPR's FAISS index")
 flags.DEFINE_boolean("create_np_memmap", False, 
                      "Whether to rebuild DPR's memmap index")
@@ -49,10 +49,10 @@ flags.DEFINE_enum   ("model", "yjernite/bart_eli5",
                      "Model to load using `.from_pretrained`.")
 flags.DEFINE_integer("log_level", logging.WARNING, 
                      "Logging verbosity.")
-flags.DEFINE_string ("dpr_faiss_path", SAVE_ROOT/"dpr_faiss.faiss", 
+flags.DEFINE_string ("dpr_faiss_path", str(SAVE_ROOT/"PCAR32,IVF262144_HNSW32,SQfp16.faiss"), 
                      "Save path of the FAISS MIPS index with the DPR "
                      "embeddings.")
-flags.DEFINE_string ("dpr_np_memmmap_path", SAVE_ROOT/"dpr_np_memmap.dat", 
+flags.DEFINE_string ("dpr_np_memmmap_path", str(SAVE_ROOT/"dpr_np_memmap.dat"), 
                      "Where to save the memory map of the DPR"
                      " embeddings.")
 
@@ -110,28 +110,8 @@ class DenseRetriever:
                   f" {USE_SUBSET/len(embeddings):0.2%}")
             embeddings = embeddings[:USE_SUBSET]
 
-        # Ref: 
-        # https://github.com/matsui528/faiss_tips
-        HNSW_M = 32 # Number of neigbors for HNSW
-        NBITS = 8 # Number of bits per subvector
-        NLIST = int(math.sqrt(len(embeddings))) 
-        # NLIST = 1000
         DIM = embeddings.shape[1]
-        NUM_SUBVECTORS = 16
-
-        # quantizer = faiss.IndexHNSWFlat(DIM, HNSW_M)
-        # quantizer = faiss.IndexFlatIP(DIM)
-        # index = faiss.IndexFlatIP(DIM)
-        # index = faiss.IndexIVFPQ(quantizer, DIM, NLIST, NUM_SUBVECTORS, NBITS)
-        # index = faiss.IndexIVFFlat(quantizer, DIM, NLIST)
-        # index = faiss.IndexHNSWSQ(DIM, faiss.ScalarQuantizer.QT_8bit, 16)
-
-        # Ref:
-        # https://github.com/facebookresearch/faiss/wiki/Indexing-1G-vectors
-        # index = faiss.index_factory(DIM, "PCAR32,IVF262144_HNSW32,SQfp16")
-        # index = faiss.index_factory(DIM, "PCAR32,IVF65536_HNSW32,SQfp16")
         index = faiss.index_factory(DIM, FLAGS.faiss_index_factory)
-        
 
         if FLAGS.faiss_use_gpu:
             print("\t- Moving to gpu")
@@ -146,7 +126,7 @@ class DenseRetriever:
 
         print("\t- Adding the embeddings...")
         start = time.time()
-        # index.add(embeddings)
+        index.add(embeddings)
         print(f"\t- Adding took "
               f"{tqdm.tqdm.format_interval(time.time() - start)}")
         
@@ -163,12 +143,13 @@ class DenseRetriever:
         index_cpu = faiss.read_index(path)
         print("Done loading FAISS index.")
         if FLAGS.faiss_use_gpu:
-            print("Moving the index to GPU.")
+            print("Moving the DPR FAISS index to the GPU.")
             faiss_res = faiss.StandardGpuResources()
-            faiss_index_dpr = faiss.index_cpu_to_gpu(faiss_res, 0, 
-                                                     faiss_index_dpr)
-            print("Done moving the index to GPU.")
-        return index_gpu
+            index_gpu = faiss.index_cpu_to_gpu(faiss_res, 0, index_cpu)
+            print("Done moving the DPR FAISS index to the GPU.")
+            return index_gpu
+        else:
+            return index_cpu
 
     @staticmethod
     def save_index(index, path: Union[pathlib.Path, str]) -> None:
@@ -293,8 +274,6 @@ def main(unused_argv: List[str]) -> None:
 
         faiss_index_dpr = DenseRetriever.load_index(
             FLAGS.dpr_faiss_path)
-    return
-
 
     ############################################################################
     # Load the questions dataset, or read inputs from the user.
@@ -325,30 +304,30 @@ def main(unused_argv: List[str]) -> None:
     # DPR Search
     ############################################################################
     print("Loading DPR tokenizer ...")
-    dpr_tokenizer = nlp.AutoTokenizer.from_pretrained(
+    dpr_tokenizer = transformers.DPRQuestionEncoderTokenizer.from_pretrained(
         "facebook/dpr-question_encoder-single-nq-base")
     print("... Done loading DPR tokenizer.")
 
     print("Loading DPR question encoder model ...")
-    dpr_model = nlp.AutoModelWithLMHead.from_pretrained(
+    dpr_model = transformers.DPRQuestionEncoder.from_pretrained(
         "facebook/dpr-question_encoder-single-nq-base")
     print("... Done loading DPR question encoder model.")
 
     # Tokenize the question for the DPR encoder
-    dpr_tokenized = dpr_tokenizer(question)
+    dpr_tokenized = dpr_tokenizer(question, return_tensors="pt")
     
     # Run the DPR encoder to get the embedding key to search FAISS with
     print("Predicting retrieval embedding ...")
     # Ref: 
     # https://huggingface.co/transformers/master/model_doc/dpr.html#dprquestionencoder
-    dpr_embedding = dpr_model(dpr_tokenized).pooler_output
-    
+    dpr_embedding = dpr_model(**dpr_tokenized)[0]
+
     # Do the FAISS search
     print("Done predicting retrieval embedding.")
-    indices = faiss_index_dpr.search(dpr_embedding, DPR_K)
-    print("Indices:", indices)
+    distances, indices = faiss_index_dpr.search(dpr_embedding.detach().numpy(), DPR_K)
+    print("Indices:", indices.shape)
     print("Text:")
-    for index in indices:
+    for index in indices[0]:
         print(" -", wiki_dpr[index]["text"], "\n")
     
     return 

@@ -1,16 +1,9 @@
 #!/bin/bash
-#SBATCH --job-name=test
-#SBATCH --output=/home/mila/g/gagnonju/logs/out_PCAR32,IVF65536_HNSW32,SQfp16.txt
-#SBATCH --error=/home/mila/g/gagnonju/logs/err_PCAR32,IVF65536_HNSW32,SQfp16.txt
-#SBATCH --ntasks=1
-#SBATCH --time=48:00
-#SBATCH --gres=gpu:turing:1
-#SBATCH --partition=long
 
 
-###############################################################################
+################################################################################
 # Utilities
-###############################################################################
+################################################################################
 # Different terminal styling constants
 GREEN="\e[32m"
 RED="\033[31m"
@@ -19,13 +12,28 @@ BOLD="\e[1m"
 RESET_ALL="\e[0m"
 RESET_FG="\e[39m"
 
-PROJECT_ROOT="$HOME/ELI5/"
+
+################################################################################
+# Checks
+################################################################################
+if [[ -z $FAISS_INDEX_FACTORY ]] ; then
+    echo ">>> FAISS_INDEX_FACTORY is unset, quitting."
+    exit
+else
+    echo -e "FAISS_INDEX_FACTORY: $BLUE$BOLD$FAISS_INDEX_FACTORY$RESET_ALL"
+fi
+
+if [[ -z $PROJECT_ROOT ]] ; then
+    echo ">>> PROJECT_ROOT is unset, quitting."
+    exit
+else
+    echo -e "PROJECT_ROOT: $BLUE$BOLD$PROJECT_ROOT$RESET_ALL"
+fi
 
 
 ################################################################################
 # Load the environment
 ################################################################################
-echo "Project root: $PROJECT_ROOT"
 echo "Loading env:"
 source "$PROJECT_ROOT/load_env.sh"
 
@@ -34,7 +42,8 @@ source "$PROJECT_ROOT/load_env.sh"
 # Run the script
 ################################################################################
 echo "Running script:"
-
 python "$PROJECT_ROOT/baseline_pretrained.py" \
-    --faiss_index_factory="PCAR32,IVF65536_HNSW32,SQfp16"
+    --faiss_index_factory="$FAISS_INDEX_FACTORY" \
+    --dpr_faiss_path="$PROJECT_ROOT/saves/$FAISS_INDEX_FACTORY.faiss" \
+    --create_faiss_dpr=True
 
