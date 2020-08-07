@@ -25,8 +25,7 @@ import torch
 import transformers
 import tqdm
 
-ELI5_QUESTION_INDEX = 34 # Max: 272634
-INDEX_NPROBE = 256
+ELI5_QUESTION_INDEX = 1134 # Max: 272634
 CREATE_MEMMAP_BATCH_SIZE = 512
 DPR_EMB_DTYPE = np.float32
 DPR_K = 5
@@ -34,32 +33,49 @@ SAVE_ROOT=pathlib.Path(__file__).parent/"saves"
 
 FLAGS = flags.FLAGS
 # Changes often
-flags.DEFINE_string("faiss_index_factory", None,
-                    "String describing the FAISS index.")
-flags.DEFINE_boolean("create_faiss_dpr", False, 
+flags.DEFINE_boolean("create_faiss_dpr", 
+                     False, 
                      "Whether to rebuild DPR's FAISS index")
-flags.DEFINE_boolean("create_np_memmap", False, 
+flags.DEFINE_boolean("create_np_memmap", 
+                     False, 
                      "Whether to rebuild DPR's memmap index")
 flags.DEFINE_enum   ("input_mode", "eli5", {"eli5", "cli"},
                      "What type of input to use for the question.")
+flags.DEFINE_boolean("create_dpr_embeddings", 
+                     False, 
+                     "Whether we generate the embeddings when creating the "
+                     "dpr memmap or if we just reuse the ones from the "
+                     "Huggingface DB.")
+flags.DEFINE_integer("nproc", len(os.sched_getaffinity(0)),
+                     "Number of cpus used to create memmap. Needs to be 1 if "
+                     "'create_dpr_embeddings' is true.")
+flags.DEFINE_integer("dpr_embedding_depth", 768, 
+                     "Depth of the DPR embeddings. If we reuse the embeddings "
+                     "from the Huggingface DB, needs to match their depth.")
+
 
 # Doesn't change quite as often
 flags.DEFINE_boolean("faiss_use_gpu", True, 
                      "Whether to use the GPU with FAISS.")
-flags.DEFINE_enum   ("model", "yjernite/bart_eli5", 
-                    {"yjernite/bart_eli5",}, 
+flags.DEFINE_enum   ("model", "yjernite/bart_eli5", {"yjernite/bart_eli5",}, 
                      "Model to load using `.from_pretrained`.")
-flags.DEFINE_integer("log_level", logging.WARNING, 
+flags.DEFINE_integer("log_level", 
+                     logging.WARNING, 
                      "Logging verbosity.")
 flags.DEFINE_string ("dpr_faiss_path", 
-                     str(SAVE_ROOT/"PCAR32,IVF262144_HNSW32,SQfp16.faiss"), 
-                    #  str(SAVE_ROOT/"PCAR32,IVF65536_HNSW32,SQfp16.faiss"),
+                     None,
+                     # str(SAVE_ROOT/"hnsw_flat.faiss"), 
+                      # str(SAVE_ROOT/"PCAR32,IVF262144_HNSW32,SQfp16.faiss"), 
+                     # str(SAVE_ROOT/"PCAR32,IVF65536_HNSW32,SQfp16.faiss"),
                      "Save path of the FAISS MIPS index with the DPR "
                      "embeddings.")
-flags.DEFINE_string ("dpr_np_memmmap_path", str(SAVE_ROOT/"dpr_np_memmap.dat"), 
-                     "Where to save the memory map of the DPR"
-                     " embeddings.")
-
+flags.DEFINE_string ("dpr_np_memmmap_path", 
+                     None, 
+                     "Where to save the memory map of the DPR "
+                     "embeddings.")
+flags.DEFINE_string ("faiss_index_factory", 
+                     None,
+                     "String describing the FAISS index.")
 
 ################################################################################
 # Utilities
@@ -115,8 +131,8 @@ class DenseRetriever:
     def __init__(self):
         raise RuntimeError("Should never be instantiated.")
 
-    @staticmethod
-    def create_index(embeddings):
+    @classmethod
+    def create_index(cls, embeddings):
         USE_SUBSET = None
         if USE_SUBSET is not None:
             print(f">> CAREFUL. Using subset {USE_SUBSET} / {len(embeddings)},"
@@ -126,6 +142,9 @@ class DenseRetriever:
         DIM = embeddings.shape[1]
         index = faiss.index_factory(DIM, FLAGS.faiss_index_factory,
                                     faiss.METRIC_INNER_PRODUCT)
+
+        # index = faiss.IndexHNSWFlat(768, 128, faiss.METRIC_INNER_PRODUCT)
+        cls.index_init(index)
 
         if FLAGS.faiss_use_gpu:
             print("\t- Moving to gpu")
@@ -144,20 +163,26 @@ class DenseRetriever:
         print(f"\t- Adding took "
               f"{tqdm.tqdm.format_interval(time.time() - start)}")
         
-        
         return index
 
     @staticmethod
     def search(index, queries, k):
         # One should be careful about assigning to attributes in Python
         assert hasattr(index, "nprobe") 
-        index.nprobe = INDEX_NPROBE
         return index.search(queries, k)
 
     @staticmethod
-    def load_index(path: Union[pathlib.Path, str]):
+    def index_init(index):
+        index.nprobe = 256
+        # index.hnsw.efsearch = 128
+        # index.hnsw.efConstruction = 200
+
+    @classmethod
+    def load_index(cls, path: Union[pathlib.Path, str]):
         print("Loading FAISS index ...")
         index_cpu = faiss.read_index(path)
+        cls.index_init(index_cpu)
+
         print("Done loading FAISS index.")
         if FLAGS.faiss_use_gpu:
             print("Moving the DPR FAISS index to the GPU.")
@@ -179,9 +204,7 @@ class DenseRetriever:
     
 
 
-def create_memmap(path, dataset, embedding_depth, 
-                  num_embeddings, batch_size,
-                  np_index_dtype):
+def create_memmap(path, dataset,  num_embeddings, batch_size, np_index_dtype):
     """Creates the mem-mapped array containing the embeddings for DPR wikipedia.
 
     Modified from 
@@ -191,31 +214,43 @@ def create_memmap(path, dataset, embedding_depth,
     DPR_NUM_EMBEDDINGS = len(dataset)
     print("\t- Creating memmap file...")
     emb_memmap = np.memmap(path,
-                         dtype=np_index_dtype, mode="w+", 
-                         shape=(num_embeddings, embedding_depth))
+                           dtype=np_index_dtype, mode="w+", 
+                           shape=(num_embeddings, FLAGS.dpr_embedding_depth))
     n_batches = math.ceil(num_embeddings / batch_size)
     avg_duration = ExpRunningAverage(0.1)
+
+    if FLAGS.create_dpr_embeddings:
+        print("Loading DPR question encoder tokenizer ...")
+        tokenizer = transformers.DPRContextEncoderTokenizer.from_pretrained(
+            "facebook/dpr-ctx_encoder-single-nq-base")
+        print("... Done loading DPR tokenizer.")
+        print("Loading DPR question encoder model ...")
+        model = transformers.DPRContextEncoder.from_pretrained(
+            "facebook/dpr-ctx_encoder-single-nq-base")
 
     # Prepare the generator for the multiprocessing situation
     def copy_embedding(i):
         start = time.time()
         emb_memmap = np.memmap(FLAGS.dpr_np_memmmap_path,
-                            dtype=DPR_EMB_DTYPE, mode="r+", 
-                            shape=(DPR_NUM_EMBEDDINGS, 
-                            embedding_depth))
-                
-        reps = [p for p in dataset[i * batch_size : (i + 1) * batch_size][
-            "embeddings"]]
+                               dtype=DPR_EMB_DTYPE, mode="r+", 
+                               shape=(DPR_NUM_EMBEDDINGS, 
+                               FLAGS.dpr_embedding_depth))
+        if FLAGS.create_dpr_embeddings:
+            text = [p for p in dataset[i * batch_size : (i + 1) * batch_size][
+                    "text"]]
+            inputs = tokenizer(text, return_tensors="pt")
+            reps = model(**inputs)
+        else:
+            reps = [p for p in dataset[i * batch_size : (i + 1) * batch_size][
+                    "embeddings"]]
         emb_memmap[i * batch_size : (i + 1) * batch_size] = reps        
         print(f"{i} / {n_batches} : took {time.time() - start:0f}s.")
         return i
     
     # Ref: https://stackoverflow.com/a/55423170/447599
-    # nproc = len(os.sched_getaffinity(0))
-    nproc = 64
     print("\t- Starting Pool...")
     duration_full_start = time.time()
-    with futures.ThreadPoolExecutor(nproc) as pool:
+    with futures.ThreadPoolExecutor(FLAGS.nproc) as pool:
         for _ in tqdm.tqdm(pool.map(copy_embedding, range(n_batches)), 
                            total=n_batches):
             pass
@@ -237,6 +272,13 @@ def main(unused_argv: List[str]) -> None:
     # Adjust the logging level
     logging.set_verbosity(FLAGS.log_level)
 
+    # Argument checks
+    if FLAGS.create_dpr_embeddings:
+        assert FLAGS.create_np_memmap
+
+    if FLAGS.create_np_memmap:
+        assert FLAGS.create_faiss_dpr
+
     # Load the snippets from wikipedia
     print(f"Loading dataset 'wiki_dpr' with embeddings...")    
     # wiki_dpr = nlp.load_dataset("wiki_dpr", "psgs_w100_no_embeddings")
@@ -247,8 +289,12 @@ def main(unused_argv: List[str]) -> None:
     ############################################################################
     # Create or load the FAISS index
     ############################################################################
-    DPR_EMBEDDING_DEPTH = len(wiki_dpr['train'][0]["embeddings"])
+    if not FLAGS.create_dpr_embeddings:
+        check_equal(FLAGS.dpr_embedding_depth, len(wiki_dpr['train'
+            ][0]["embeddings"]))
+
     DPR_NUM_EMBEDDINGS = len(wiki_dpr['train'])
+
     if FLAGS.create_faiss_dpr:
         # We will create the FAISS index.
         # But first, we have to prepare the context embeddings by
@@ -268,14 +314,14 @@ def main(unused_argv: List[str]) -> None:
                     f"Delete it if you want to create a new DPR Numpy index.")
 
             create_memmap(FLAGS.dpr_np_memmmap_path, wiki_dpr["train"], 
-                          DPR_EMBEDDING_DEPTH, DPR_NUM_EMBEDDINGS,
+                          FLAGS.dpr_embedding_depth, DPR_NUM_EMBEDDINGS,
                           CREATE_MEMMAP_BATCH_SIZE, DPR_EMB_DTYPE)
 
         # Open the memory mapped array for reading.
         dpr_np_memmap = np.memmap(FLAGS.dpr_np_memmmap_path,
                                   dtype=DPR_EMB_DTYPE, mode="r", 
                                   shape=(DPR_NUM_EMBEDDINGS, 
-                                  DPR_EMBEDDING_DEPTH))
+                                  FLAGS.dpr_embedding_depth))
 
         # Actually create the FAISS index.
         print("\nCreating dpr faiss index ...")
@@ -287,6 +333,7 @@ def main(unused_argv: List[str]) -> None:
         DenseRetriever.save_index(faiss_index_dpr, 
                                   FLAGS.dpr_faiss_path)
         print("Done saving dpr faiss index.")
+        return
     else:
 
         faiss_index_dpr = DenseRetriever.load_index(

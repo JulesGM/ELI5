@@ -17,12 +17,13 @@ RESET_FG="\e[39m"
 ################################################################################
 # Define constants
 ################################################################################
-# export FAISS_INDEX_FACTORY="PCAR32,IVF262144_HNSW32,SQfp16"
-export FAISS_INDEX_FACTORY="hnsw_flat"
-# export FAISS_INDEX_FACTORY="PCAR32,IVF65536_HNSW32,SQfp16"
+export FAISS_INDEX_FACTORY="PCAR128,IVF16384,SQfp16"
 GPU_TYPE=turing
 PARTITION=long
 export PROJECT_ROOT="$HOME/ELI5/"
+export CREATE_NP_MEMMAP=true
+export CREATE_DPR_EMBEDDINGS=true
+export DPR_EMBEDDING_DEPTH=128
 
 
 # echo -e "GPU_TYPE:            $BLUE$BOLD$GPU_TYPE$RESET_ALL"

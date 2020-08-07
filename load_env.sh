@@ -42,10 +42,9 @@ if $NOT_INTERACTIVE; then
     echo "# Node information:"
     echo "###########################################################"
 
-    echo -e "Interactive shell?: $-"
     echo -e "Hostname: $BLUE$BOLD$HOSTNAME$RESET_ALL"
-    echo -e "\n\n"
-    nvidia-smi
+    GPU_INFO="$(nvidia-smi --query-gpu=gpu_name,memory.total --format=csv | tail -n 1)"
+    echo -e "GPU info: $BLUE$BOLD$GPU_INFO$RESET_ALL"
 fi
 
 
@@ -65,10 +64,10 @@ echo "###########################################################"
 echo "# Load Modules"
 echo "###########################################################"
 
-echo -e "\nModule load pytorch:"
+echo -e "Loading the Pytorch module"
 module load pytorch
 
-echo -e "\nModule load cuda 10:"
+echo -e "Loading the Cuda modules"
 module load cuda/10.0
 module load cuda/10.0/cudnn/7.6
 
@@ -80,7 +79,7 @@ if [[ "$(conda env list | grep -Eo ^\\w+ | grep -E eli5)" != "" ]] ; then
     echo "# Activating the VENV"
     echo "###########################################################"
     
-    echo -e "\nActivating venv ..."
+    echo -e "Activating venv ..."
     conda activate eli5
     echo "Done activating venv."
 else
@@ -131,6 +130,7 @@ if [[ "$(which python)" != "$CORRECT_PYTHON" ]] ; then
     echo -e "$X_MARK Incorrect Python executable:"
     echo -e "\tGot:     \t$(which python)"
     echo -e "\tExpected:\t$CORRECT_PYTHON"
+    exit 1
 else
     echo -e "$CHECK Correct Python executable."
 fi
@@ -139,6 +139,7 @@ fi
 python -c "import colored_traceback.auto; import faiss"
 if [[ $? -eq 1 ]] ; then
     echo -e "$X_MARK Could not import FAISS."
+    exit 1
 else
     echo -e "$CHECK Imported FAISS successfully."
 fi
@@ -147,6 +148,7 @@ fi
 python -c "import colored_traceback.auto; import torch"
 if [[ $? -eq 1 ]] ; then
     echo -e "$X_MARK Could not import Pytorch."
+    exit 1
 else
     echo -e "$CHECK Imported Pytorch successfully."
 fi
