@@ -16,7 +16,7 @@ from absl import logging
 from absl import app
 from absl import flags
 import click
-import colored_traceback.auto
+import colored_traceback.always
 import faiss
 import matplotlib.pyplot as plt
 import nlp
@@ -30,6 +30,7 @@ CREATE_MEMMAP_BATCH_SIZE = 512
 DPR_EMB_DTYPE = np.float32
 DPR_K = 5
 SAVE_ROOT=pathlib.Path(__file__).parent/"saves"
+MAX_LENGTH = 128
 
 FLAGS = flags.FLAGS
 # Changes often
@@ -39,25 +40,32 @@ flags.DEFINE_boolean("create_faiss_dpr",
 flags.DEFINE_boolean("create_np_memmap", 
                      False, 
                      "Whether to rebuild DPR's memmap index")
-flags.DEFINE_enum   ("input_mode", "eli5", {"eli5", "cli"},
+flags.DEFINE_enum   ("input_mode", 
+                     "eli5", 
+                    {"eli5", "cli"},
                      "What type of input to use for the question.")
 flags.DEFINE_boolean("create_dpr_embeddings", 
                      False, 
                      "Whether we generate the embeddings when creating the "
                      "dpr memmap or if we just reuse the ones from the "
                      "Huggingface DB.")
-flags.DEFINE_integer("nproc", len(os.sched_getaffinity(0)),
+flags.DEFINE_integer("nproc", 
+                     len(os.sched_getaffinity(0)),
                      "Number of cpus used to create memmap. Needs to be 1 if "
                      "'create_dpr_embeddings' is true.")
-flags.DEFINE_integer("dpr_embedding_depth", 768, 
+flags.DEFINE_integer("dpr_embedding_depth", 
+                     768, 
                      "Depth of the DPR embeddings. If we reuse the embeddings "
                      "from the Huggingface DB, needs to match their depth.")
 
 
 # Doesn't change quite as often
-flags.DEFINE_boolean("faiss_use_gpu", True, 
+flags.DEFINE_boolean("faiss_use_gpu", 
+                     True, 
                      "Whether to use the GPU with FAISS.")
-flags.DEFINE_enum   ("model", "yjernite/bart_eli5", {"yjernite/bart_eli5",}, 
+flags.DEFINE_enum   ("model", 
+                     "yjernite/bart_eli5", 
+                     {"yjernite/bart_eli5",}, 
                      "Model to load using `.from_pretrained`.")
 flags.DEFINE_integer("log_level", 
                      logging.WARNING, 
@@ -65,7 +73,7 @@ flags.DEFINE_integer("log_level",
 flags.DEFINE_string ("dpr_faiss_path", 
                      None,
                      # str(SAVE_ROOT/"hnsw_flat.faiss"), 
-                      # str(SAVE_ROOT/"PCAR32,IVF262144_HNSW32,SQfp16.faiss"), 
+                     # str(SAVE_ROOT/"PCAR32,IVF262144_HNSW32,SQfp16.faiss"), 
                      # str(SAVE_ROOT/"PCAR32,IVF65536_HNSW32,SQfp16.faiss"),
                      "Save path of the FAISS MIPS index with the DPR "
                      "embeddings.")
@@ -77,27 +85,31 @@ flags.DEFINE_string ("faiss_index_factory",
                      None,
                      "String describing the FAISS index.")
 
+
 ################################################################################
 # Utilities
 ################################################################################
 def print_iterable(iterable: Iterable, extra_return: bool = False) -> None:
-    """
-    Assumes that there is an end to the iterable, or will run forever.
+    """ Assumes that there is an end to the iterable, or will run forever.
     """
     print("\n".join([f" - {arg}" for arg in iterable]))
     if extra_return:
         print("")
 
+
 def check(condition: bool, message: str) -> None:
     if not condition:
         raise RuntimeError(message)
 
+
 def check_equal(a: Any, b: Any)  -> None:
     check(a == b, f"Expected arguments to be equal, got \n{a} != {b}.")
+
 
 def check_type(obj: Any, type_: type) -> None:
     check(isinstance(obj, type_), 
           f"Failed isinstance. Expected type `{type_}`, got `{type(obj)}`.")
+
 
 class ExpRunningAverage:
     def __init__(self, new_contrib_rate: float):
@@ -113,14 +125,17 @@ class ExpRunningAverage:
     
         return self.running_average
 
+
 def get_terminal_width():
     rows, columns = os.popen('stty size', 'r').read().split()
     return int(columns)
+
 
 def wrap(text, joiner, padding=4):
     wrapped = [line.strip() for line in 
                textwrap.wrap(text, get_terminal_width() - padding)]
     return joiner.join(wrapped)
+
 
 ################################################################################
 # Dense Retriever Namespace
@@ -203,6 +218,18 @@ class DenseRetriever:
         print("Done saving the index")
     
 
+def embed_passages_for_retrieval(passages, tokenizer, qa_embedder, max_length=128, device="cuda:0"):
+    # Mostly taken from 
+    # https://github.com/huggingface/notebooks/blob/master/longform-qa/lfqa_utils.py
+
+    a_toks = tokenizer.batch_encode_plus(passages, max_length=max_length, 
+                                         pad_to_max_length=True)
+    a_ids, a_mask = (torch.LongTensor(a_toks["input_ids"]).to(device),
+                     torch.LongTensor(a_toks["attention_mask"]).to(device))    
+    pooled_output = qa_embedder(a_ids, a_mask)[0].detach()
+
+    return pooled_output.cpu().type(torch.float).numpy()
+
 
 def create_memmap(path, dataset,  num_embeddings, batch_size, np_index_dtype):
     """Creates the mem-mapped array containing the embeddings for DPR wikipedia.
@@ -226,7 +253,7 @@ def create_memmap(path, dataset,  num_embeddings, batch_size, np_index_dtype):
         print("... Done loading DPR tokenizer.")
         print("Loading DPR question encoder model ...")
         model = transformers.DPRContextEncoder.from_pretrained(
-            "facebook/dpr-ctx_encoder-single-nq-base")
+            "facebook/dpr-ctx_encoder-single-nq-base").cuda()
 
     # Prepare the generator for the multiprocessing situation
     def copy_embedding(i):
@@ -238,13 +265,14 @@ def create_memmap(path, dataset,  num_embeddings, batch_size, np_index_dtype):
         if FLAGS.create_dpr_embeddings:
             text = [p for p in dataset[i * batch_size : (i + 1) * batch_size][
                     "text"]]
-            inputs = tokenizer(text, return_tensors="pt")
-            reps = model(**inputs)
+            reps = embed_passages_for_retrieval(
+                text, tokenizer, model, MAX_LENGTH)
         else:
             reps = [p for p in dataset[i * batch_size : (i + 1) * batch_size][
                     "embeddings"]]
         emb_memmap[i * batch_size : (i + 1) * batch_size] = reps        
-        print(f"{i} / {n_batches} : took {time.time() - start:0f}s.")
+        print(f"{i} / {n_batches} : took {time.time() - start:0f}s - "
+              f"writing to '{FLAGS.dpr_np_memmmap_path}'")
         return i
     
     # Ref: https://stackoverflow.com/a/55423170/447599
@@ -308,14 +336,14 @@ def main(unused_argv: List[str]) -> None:
 
         if FLAGS.create_np_memmap:
             # Create the memory mapped array.
-            if pathlib.Path(FLAGS.dpr_np_memmmap_patindex_toh).exists():
+            if pathlib.Path(FLAGS.dpr_np_memmmap_path).exists():
                 raise RuntimeError(
                     f"`{FLAGS.dpr_np_memmmap_path}` already exists. "
                     f"Delete it if you want to create a new DPR Numpy index.")
 
             create_memmap(FLAGS.dpr_np_memmmap_path, wiki_dpr["train"], 
-                          FLAGS.dpr_embedding_depth, DPR_NUM_EMBEDDINGS,
-                          CREATE_MEMMAP_BATCH_SIZE, DPR_EMB_DTYPE)
+                          DPR_NUM_EMBEDDINGS, CREATE_MEMMAP_BATCH_SIZE, 
+                          DPR_EMB_DTYPE)
 
         # Open the memory mapped array for reading.
         dpr_np_memmap = np.memmap(FLAGS.dpr_np_memmmap_path,
