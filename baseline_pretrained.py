@@ -25,12 +25,14 @@ import torch
 import transformers
 import tqdm
 
-ELI5_QUESTION_INDEX = 1134 # Max: 272634
+QUESTION_INDICES = [1, 11, 111, 1111, 11111, 111111] # Max: 272634
 CREATE_MEMMAP_BATCH_SIZE = 512
 DPR_EMB_DTYPE = np.float32
 DPR_K = 5
 SAVE_ROOT=pathlib.Path(__file__).parent/"saves"
 MAX_LENGTH = 128
+N_CONTEXTS_PER_DISPLAY = 3
+N_GENERATIONS_PER_DISPLAY = 3
 
 FLAGS = flags.FLAGS
 # Changes often
@@ -41,7 +43,8 @@ flags.DEFINE_boolean("create_np_memmap",
                      False, 
                      "Whether to rebuild DPR's memmap index")
 flags.DEFINE_enum   ("input_mode", 
-                     "eli5", 
+                    #  "eli5", 
+                    "cli",
                     {"eli5", "cli"},
                      "What type of input to use for the question.")
 flags.DEFINE_boolean("create_dpr_embeddings", 
@@ -89,10 +92,42 @@ flags.DEFINE_string ("faiss_index_factory",
 ################################################################################
 # Utilities
 ################################################################################
+def get_terminal_width(default=80):
+    try:
+        _, columns = os.popen('stty size', 'r').read().split()
+    except ValueError as err:
+        columns = default
+    return int(columns)
+
+
+def wrap(text, joiner, padding=4):
+    wrapped = [line.strip() for line in 
+               textwrap.wrap(text, get_terminal_width() - padding)]
+    return joiner.join(wrapped)
+
+
+def print_wrapped(text, first_line="   "):
+    print(first_line + wrap(text, "\n   ", 3))
+
+
 def print_iterable(iterable: Iterable, extra_return: bool = False) -> None:
     """ Assumes that there is an end to the iterable, or will run forever.
     """
-    print("\n".join([f" - {arg}" for arg in iterable]))
+    for line in iterable:
+            print_wrapped(line, " - ")
+            print("")
+    
+    if extra_return:
+        print("")
+
+def print_numbered_iterable(iterable: Iterable, 
+                            extra_return: bool = False) -> None:
+    """ Assumes that there is an end to the iterable, or will run forever.
+    """
+    for i, line in enumerate(iterable):
+            print_wrapped(line, f"{i}. ")
+            print("")
+    
     if extra_return:
         print("")
 
@@ -124,17 +159,6 @@ class ExpRunningAverage:
                 (1 - self.new_contrib_rate) * self.running_average)
     
         return self.running_average
-
-
-def get_terminal_width():
-    rows, columns = os.popen('stty size', 'r').read().split()
-    return int(columns)
-
-
-def wrap(text, joiner, padding=4):
-    wrapped = [line.strip() for line in 
-               textwrap.wrap(text, get_terminal_width() - padding)]
-    return joiner.join(wrapped)
 
 
 ################################################################################
@@ -218,8 +242,9 @@ class DenseRetriever:
         print("Done saving the index")
     
 
-def embed_passages_for_retrieval(passages, tokenizer, qa_embedder, max_length=128, device="cuda:0"):
-    # Mostly taken from 
+def embed_passages_for_retrieval(passages, tokenizer, qa_embedder, 
+                                 max_length=128, device="cuda:0"):
+    # Ref:
     # https://github.com/huggingface/notebooks/blob/master/longform-qa/lfqa_utils.py
 
     a_toks = tokenizer.batch_encode_plus(passages, max_length=max_length, 
@@ -286,7 +311,58 @@ def create_memmap(path, dataset,  num_embeddings, batch_size, np_index_dtype):
     tqdm.tqdm.write(f"Took: {tqdm.tqdm.format_interval(duration_full)}")
 
     print("Done creating mmap.")
+
+
+def dpr_faiss_retrieve(faiss_index_dpr, 
+                       dpr_tokenizer: transformers.DPRQuestionEncoderTokenizer, 
+                       dpr_question_encoder: transformers.DPRQuestionEncoder, 
+                       question : str):
+    check_type(question, str)
+    check_type(dpr_tokenizer, transformers.DPRQuestionEncoderTokenizer)
+    check_type(dpr_question_encoder, transformers.DPRQuestionEncoder)
+
+    # Tokenize the question for the DPR encoder
+    dpr_tokenized = dpr_tokenizer(question, return_tensors="pt")
     
+    # Run inference
+    dpr_embedding = dpr_question_encoder(**dpr_tokenized)[0]
+
+    # Run search with FAISS
+    distances, indices = faiss_index_dpr.search(dpr_embedding.detach().numpy(), 
+                                                DPR_K)
+
+    return indices[0]
+
+
+def bart_predict(bart_tokenizer: transformers.BartTokenizer, 
+                bart_model: transformers.modeling_bart.BartForConditionalGeneration,
+                question: str, retrieved_contexts: List[str]):
+
+    check_type(bart_tokenizer, transformers.BartTokenizer)
+    check_type(bart_model, 
+               transformers.modeling_bart.BartForConditionalGeneration)
+    check_type(question, str)
+    predictions = []
+
+    for i in range(N_CONTEXTS_PER_DISPLAY):    
+        # context_string = "<P> " + " <P> ".join(retrieved_contexts) + " <P> "
+        context_string = "<P> " + retrieved_contexts[i] + " <P> "
+        tokenized_sample = bart_tokenizer(context_string + question,
+                                            return_tensors="pt")
+        sample_predictions = bart_model.generate(**tokenized_sample, 
+            do_sample=True,
+            max_length=1024, 
+            num_return_sequences=N_GENERATIONS_PER_DISPLAY,
+            top_k=10)
+
+        for j in range(N_GENERATIONS_PER_DISPLAY):
+            i_txt = click.style(str(i), fg="blue")
+            j_txt = click.style(str(j), fg="green")
+            predictions.append((f"[ctx {i_txt} / gen {j_txt}]", 
+                                sample_predictions[j]))
+
+    return predictions
+
 
 ################################################################################
 # Main
@@ -368,66 +444,87 @@ def main(unused_argv: List[str]) -> None:
             FLAGS.dpr_faiss_path)
 
     ############################################################################
-    # Load the questions dataset, or read inputs from the user.
+    # Load Questions & Search DPR
     ############################################################################
-    if FLAGS.input_mode == "eli5":
-        # Load dataset
-        print("Loading dataset 'eli5' ...")
-        eli5 = nlp.load_dataset("eli5")
-        print("Done loading dataset 'eli5'.")
-
-        # Attempt to get a prediction
-        sample = eli5["train_eli5"][ELI5_QUESTION_INDEX]
-        question = sample["title"]
-
-        check_type(question, str)
-        answers = sample["answers"]["text"]
-        print("\nQuestion:")
-        print("   " + question)
-
-        print("\nLabels:")
-        for answer in answers:
-            print(" - " + wrap(answer, "\n   ", 3) + "\n")
-        print("")
-
-    elif FLAGS.input_mode == "cli":
-        question = input("Question: ")
-
-
-    ############################################################################
-    # DPR Search
-    ############################################################################
-    # print("Loading DPR tokenizer ...")
     dpr_tokenizer = transformers.DPRQuestionEncoderTokenizer.from_pretrained(
         "facebook/dpr-question_encoder-single-nq-base")
-    # print("... Done loading DPR tokenizer.")
-
-    # print("Loading DPR question encoder model ...")
-    dpr_model = transformers.DPRQuestionEncoder.from_pretrained(
-        "facebook/dpr-question_encoder-single-nq-base")
-    # bert_base = transformers.BertModel.from_pretrained("bert-base-uncased")
-    # dpr_model.question_encoder.bert_model.embeddings.position_ids = (
-    #     bert_base.embeddings.position_ids)
-    # print("... Done loading DPR question encoder model.")
-
-    # Tokenize the question for the DPR encoder
-    dpr_tokenized = dpr_tokenizer(question, return_tensors="pt")
     
-    # Run the DPR encoder to get the embedding key to search FAISS with
-    # print("Predicting retrieval embedding ...")
-    # Ref: 
-    # https://huggingface.co/transformers/master/model_doc/dpr.html#dprquestionencoder
-    dpr_embedding = dpr_model(**dpr_tokenized)[0]
+    dpr_question_encoder = transformers.DPRQuestionEncoder.from_pretrained(
+        "facebook/dpr-question_encoder-single-nq-base")
 
-    # Do the FAISS search
-    # print("Done predicting retrieval embedding.")
-    distances, indices = faiss_index_dpr.search(dpr_embedding.detach().numpy(), DPR_K)
-    # print("Indices:", indices.shape)
-    print("Contexts:\n")
-    for index in indices[0]:
-        print(" - " + wrap(wiki_dpr["train"][int(index)]["text"], "\n   ", 3) 
-              + "\n")
+    bart_tokenizer = transformers.AutoTokenizer.from_pretrained(FLAGS.model)
+    bart_model = transformers.AutoModelForSeq2SeqLM.from_pretrained(
+        FLAGS.model)
 
+    eli5 = nlp.load_dataset("eli5")
+
+    if FLAGS.input_mode == "eli5":
+        ds = eli5["train_eli5"]
+        questions = (ds[question_index]["title"].strip()
+                     for question_index in QUESTION_INDICES)
+        answers = (map(str.strip, ds[question_index]["answers"]["text"])
+                   for question_index in QUESTION_INDICES)
+        indices = QUESTION_INDICES
+    elif FLAGS.input_mode == "cli":
+        questions = [input("Please write a question: ").strip()]
+        answers = ["N/A"]
+        indices = ["N/A"]
+    else:
+        raise RuntimeError(f"Unsupported input_mode: {FLAGS.input_mode}")
+
+    def print_title(text):
+        """ This allows us to style all titles from one place.
+        A bit too cute, maybe.
+        """
+        print(click.style(text, bold=True))
+
+    for question, answers, index in zip(questions, answers, indices):
+        check_type(question, str)
+        # number_string = click.style(f"#{question_index}", fg="green")
+        number_string = click.style(f"#{index}", fg="blue")
+
+        print_title(f"Question {number_string}:")
+        print("")
+        print_wrapped(question)
+        print("")
+
+        # Print the annotated anwers:
+        # print_title("\nLabels:")
+        # print_iterable(answers)
+        # print("")
+
+        # Retrieve contexts and print them:
+        contexts = dpr_faiss_retrieve(faiss_index_dpr=faiss_index_dpr, 
+                                      dpr_tokenizer=dpr_tokenizer, 
+                                      dpr_question_encoder=dpr_question_encoder, 
+                                      question=question)
+        context_texts = [wiki_dpr["train"][int(context_index)]["text"] 
+                         for context_index in contexts]
+        print_title(f"Contexts for question {number_string}:")
+        print("")
+        print_numbered_iterable(context_texts)
+        print("")
+
+        # Print a reminder of the questions
+        print_title(f"Question reminder for {number_string}:")
+        print("")
+        print_wrapped(question)
+        print("")
+
+        # Generate answers and print them:
+        sample_predictions = bart_predict(bart_tokenizer, bart_model, 
+                                          question, context_texts)
+        
+        formatted_answers = [] 
+        for info, sample_prediction in sample_predictions:
+            gen_line = bart_tokenizer.decode(sample_prediction)
+            gen_line = gen_line.replace("<pad>", "").replace("</s>", "") 
+            formatted_answers.append(f"{info}: " + gen_line)
+        
+        print_title(f"Predictions for question {number_string}:")
+        print("")
+        print_iterable(formatted_answers)
+        print("")
     return 
 
 
@@ -435,31 +532,7 @@ def main(unused_argv: List[str]) -> None:
     # BART inference
     ############################################################################
     # Load the tokenizer    
-    bart_tokenizer = transformers.AutoTokenizer.from_pretrained(FLAGS.model)
 
-    print("\nTokenizing question..")
-    tokenized_sample = bart_tokenizer(question, return_tensors="pt")
-
-
-    print(f"\nLoading model '{FLAGS.model}'...")
-    model = transformers.AutoModelForSeq2SeqLM.from_pretrained(
-        FLAGS.model)
-    print(f"Done loading model '{FLAGS.model}'.")
-
-    print("\nPredicting answer")
-    sample_predictions = model.generate(**tokenized_sample, 
-        do_sample=True,
-        max_length=1024, 
-        num_return_sequences=10,
-        top_k=10)
-
-    # Print the results:
-    print(click.style("\nQuestion:", bold=True), 
-          click.style(question, fg="green") + "\n")
-    for sample_prediction in sample_predictions:
-        print(click.style("decoded output_sequence:", bold=True), 
-              tokenizer.decode(sample_prediction).replace("<pad>", ""))
-        print("")
 
 if __name__ == "__main__":
     app.run(main)

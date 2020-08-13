@@ -54,24 +54,31 @@ parse_args "$@"
 ################################################################################
 # Define constants
 ################################################################################
-export FAISS_INDEX_FACTORY="PCAR128,IVF16384,SQfp16"
 GPU_TYPE=turing
 PARTITION=long
 export PROJECT_ROOT="$HOME/ELI5/"
 
 if [[ -z "$USE_PREMAID_EMBS" ]]; then
-    export DPR_EMBEDDING_DEPTH=768
     export CREATED_DPR_EMBEDDINGS=true
 
+    # Creation Mode: 
+    export FAISS_INDEX_FACTORY="PCAR128,IVF262144,SQfp16"
     # export CREATE_DPR_EMBEDDINGS=true
-    export CREATE_DPR_EMBEDDINGS=
     # export CREATE_NP_MEMMAP=true
+    export CREATE_FAISS_DPR=true
+
+    # "Inference" Mode:
+    # export FAISS_INDEX_FACTORY="PCAR128,IVF16384,SQfp16"
+    export CREATE_DPR_EMBEDDINGS=
     export CREATE_NP_MEMMAP=
+    # export CREATE_FAISS_DPR=
 
     LOG_OUT_PATH="$PROJECT_ROOT/logs/out_EMBS_"$FAISS_INDEX_FACTORY"_"$TIMESTAMP".txt"
     LOG_ERR_PATH="$PROJECT_ROOT/logs/err_EMBS_"$FAISS_INDEX_FACTORY"_"$TIMESTAMP".txt"
     JOB_NAME="EMBS_$FAISS_INDEX_FACTORY"
 else
+    export FAISS_INDEX_FACTORY="PCAR128,IVF16384,SQfp16"
+    export CREATE_FAISS_DPR=true
     LOG_OUT_PATH="$PROJECT_ROOT/logs/out_"$FAISS_INDEX_FACTORY"_"$TIMESTAMP".txt"
     LOG_ERR_PATH="$PROJECT_ROOT/logs/err_"$FAISS_INDEX_FACTORY"_"$TIMESTAMP".txt"
     JOB_NAME="$FAISS_INDEX_FACTORY"
@@ -82,10 +89,10 @@ fi
 # Run job(s)
 ################################################################################
 if [[ ! -z "${INTERACTIVE}" ]] ; then
-    echo -e "${GREEN}${BOLD}Running in interactive mode${RESET_ALL}"
+    echo -e "${BLUE}${BOLD}Running in interactive mode${RESET_ALL}"
     source "${PROJECT_ROOT}"/run_baseline_pretrained.sh
 else
-    echo -e "${GREEN}${BOLD}Running in batch mode${RESET_ALL}"
+    echo -e "${BLUE}${BOLD}Running in batch mode${RESET_ALL}"
     TIMESTAMP="$(date +'%Y-%m-%d_%H-%M-%S')"
     sbatch \
     --output="${LOG_OUT_PATH}" \

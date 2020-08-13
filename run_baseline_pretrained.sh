@@ -45,10 +45,9 @@ if [[ ! -z $DPR_EMBEDDING_DEPTH ]] ; then
 else
     EXTRA_ARGS="--dpr_embedding_depth=768 $EXTRA_ARGS"
 fi
-
-echo -e "EXTRA_ARGS: $BOLD$BLUE$EXTRA_ARGS$RESET_ALL"
-echo -e "NP_MEMMAP_NAME: $BOLD$BLUE$NP_MEMMAP_NAME$RESET_ALL"
-echo -e "FAISS_NAME: $BOLD$BLUE$FAISS_NAME$RESET_ALL"
+if [[ ! -z $CREATE_FAISS_DPR ]] ; then
+    EXTRA_ARGS="--create_faiss_dpr=True $EXTRA_ARGS"
+fi
 
 
 ################################################################################
@@ -94,10 +93,17 @@ source "$PROJECT_ROOT/load_env.sh"
 ################################################################################
 # Run the script
 ################################################################################
-echo "Running script:"
+echo -e "\n\nRunning script:"
+echo -e " - CREATE_DPR_EMBEDDINGS: $BOLD$GREEN$CREATE_DPR_EMBEDDINGS$RESET_ALL"
+echo -e " - CREATE_NP_MEMMAP:      $BOLD$GREEN$CREATE_NP_MEMMAP$RESET_ALL"
+echo -e " - CREATE_FAISS_DPR:      $BOLD$GREEN$CREATE_FAISS_DPR$RESET_ALL"
+echo -e " - EXTRA_ARGS:            $BOLD$BLUE$EXTRA_ARGS$RESET_ALL"
+echo -e " - NP_MEMMAP_NAME:        $BOLD$BLUE$NP_MEMMAP_NAME$RESET_ALL"
+echo -e " - FAISS_NAME:            $BOLD$BLUE$FAISS_NAME$RESET_ALL"
+echo -e "\n"
 python "$PROJECT_ROOT/baseline_pretrained.py" \
     --faiss_index_factory="$FAISS_INDEX_FACTORY" \
     --dpr_faiss_path="$PROJECT_ROOT/saves/$FAISS_NAME.faiss" \
     --dpr_np_memmmap_path="$PROJECT_ROOT/saves/$NP_MEMMAP_NAME.dat" \
-    --create_faiss_dpr=True \
+    --input_mode eli5 \
     $EXTRA_ARGS
