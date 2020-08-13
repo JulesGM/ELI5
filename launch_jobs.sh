@@ -62,16 +62,16 @@ if [[ -z "$USE_PREMAID_EMBS" ]]; then
     export CREATED_DPR_EMBEDDINGS=true
 
     # Creation Mode: 
-    export FAISS_INDEX_FACTORY="PCAR128,IVF262144,SQfp16"
+    export FAISS_INDEX_FACTORY="PCAR512,IVF262144,SQfp16"
     # export CREATE_DPR_EMBEDDINGS=true
     # export CREATE_NP_MEMMAP=true
-    export CREATE_FAISS_DPR=true
+    # export CREATE_FAISS_DPR=true
 
     # "Inference" Mode:
     # export FAISS_INDEX_FACTORY="PCAR128,IVF16384,SQfp16"
     export CREATE_DPR_EMBEDDINGS=
     export CREATE_NP_MEMMAP=
-    # export CREATE_FAISS_DPR=
+    export CREATE_FAISS_DPR=
 
     LOG_OUT_PATH="$PROJECT_ROOT/logs/out_EMBS_"$FAISS_INDEX_FACTORY"_"$TIMESTAMP".txt"
     LOG_ERR_PATH="$PROJECT_ROOT/logs/err_EMBS_"$FAISS_INDEX_FACTORY"_"$TIMESTAMP".txt"
