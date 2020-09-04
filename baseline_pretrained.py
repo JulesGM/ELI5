@@ -1,10 +1,12 @@
 import importlib
+import logging
 import math
 import concurrent.futures as futures
 import pathlib
 import os
 import json
 import six
+import string
 import sys
 import textwrap
 import time
@@ -12,7 +14,7 @@ import types
 from typing import *
 
 import absl
-from absl import logging
+# from absl import logging
 from absl import app
 from absl import flags
 import click
@@ -25,12 +27,20 @@ import torch
 import transformers
 import tqdm
 
+from utils import *
+from dpr_utils import *
+
+LOGGER = logging.getLogger(__name__)
+
 QUESTION_INDICES = [1, 11, 111, 1111, 11111, 111111] # Max: 272634
 CREATE_MEMMAP_BATCH_SIZE = 512
+DEVICE = "cuda:0"
 DPR_EMB_DTYPE = np.float32
 DPR_K = 5
-SAVE_ROOT=pathlib.Path(__file__).parent/"saves"
-MAX_LENGTH = 128
+SAVE_ROOT = pathlib.Path(__file__).parent/"saves"
+MAX_LENGTH_CONTEXT = 128
+MAX_LENGTH_PREDICTION = 1024
+PREDICTION_TOP_K_QUANTITY = 10
 N_CONTEXTS_PER_DISPLAY = 3
 N_GENERATIONS_PER_DISPLAY = 3
 
@@ -43,9 +53,8 @@ flags.DEFINE_boolean("create_np_memmap",
                      False, 
                      "Whether to rebuild DPR's memmap index")
 flags.DEFINE_enum   ("input_mode", 
-                    #  "eli5", 
-                    "cli",
-                    {"eli5", "cli"},
+                    "trivia_qa",
+                    {"eli5", "cli", "trivia_qa"},
                      "What type of input to use for the question.")
 flags.DEFINE_boolean("create_dpr_embeddings", 
                      False, 
@@ -64,20 +73,22 @@ flags.DEFINE_integer("dpr_embedding_depth",
 
 # Doesn't change quite as often
 flags.DEFINE_boolean("faiss_use_gpu", 
-                     True, 
+                     False, 
                      "Whether to use the GPU with FAISS.")
 flags.DEFINE_enum   ("model", 
                      "yjernite/bart_eli5", 
                      {"yjernite/bart_eli5",}, 
                      "Model to load using `.from_pretrained`.")
 flags.DEFINE_integer("log_level", 
-                     logging.WARNING, 
+                     logging.DEBUG, 
                      "Logging verbosity.")
+flags.DEFINE_integer("log_level_hf_nlp", 
+                     logging.WARNING, 
+                     "Logging verbosity of the very talkative huggingface "
+                     "nlp module.")
 flags.DEFINE_string ("dpr_faiss_path", 
-                     None,
-                     # str(SAVE_ROOT/"hnsw_flat.faiss"), 
-                     # str(SAVE_ROOT/"PCAR32,IVF262144_HNSW32,SQfp16.faiss"), 
-                     # str(SAVE_ROOT/"PCAR32,IVF65536_HNSW32,SQfp16.faiss"),
+                    #  str(SAVE_ROOT/"created_embs_PCAR512,IVF262144,SQfp16.faiss"),
+                     "/home/mila/g/gagnonju/.cache/huggingface/datasets/wiki_dpr/psgs_w100_with_nq_embeddings/0.0.0/10ec144a48046e48521e2c13993f1ce21c9ab0a702d9ec1eb2b1e604f91eb929/psgs_w100.nq.IVFPQ4096_HNSW32_PQ64-IP-train.faiss",
                      "Save path of the FAISS MIPS index with the DPR "
                      "embeddings.")
 flags.DEFINE_string ("dpr_np_memmmap_path", 
@@ -87,251 +98,6 @@ flags.DEFINE_string ("dpr_np_memmmap_path",
 flags.DEFINE_string ("faiss_index_factory", 
                      None,
                      "String describing the FAISS index.")
-
-
-################################################################################
-# Utilities
-################################################################################
-def get_terminal_width(default=80):
-    try:
-        _, columns = os.popen('stty size', 'r').read().split()
-    except ValueError as err:
-        columns = default
-    return int(columns)
-
-
-def wrap(text, joiner, padding=4):
-    wrapped = [line.strip() for line in 
-               textwrap.wrap(text, get_terminal_width() - padding)]
-    return joiner.join(wrapped)
-
-
-def print_wrapped(text, first_line="   "):
-    print(first_line + wrap(text, "\n   ", 3))
-
-
-def print_iterable(iterable: Iterable, extra_return: bool = False) -> None:
-    """ Assumes that there is an end to the iterable, or will run forever.
-    """
-    for line in iterable:
-            print_wrapped(line, " - ")
-            print("")
-    
-    if extra_return:
-        print("")
-
-def print_numbered_iterable(iterable: Iterable, 
-                            extra_return: bool = False) -> None:
-    """ Assumes that there is an end to the iterable, or will run forever.
-    """
-    for i, line in enumerate(iterable):
-            print_wrapped(line, f"{i}. ")
-            print("")
-    
-    if extra_return:
-        print("")
-
-
-def check(condition: bool, message: str) -> None:
-    if not condition:
-        raise RuntimeError(message)
-
-
-def check_equal(a: Any, b: Any)  -> None:
-    check(a == b, f"Expected arguments to be equal, got \n{a} != {b}.")
-
-
-def check_type(obj: Any, type_: type) -> None:
-    check(isinstance(obj, type_), 
-          f"Failed isinstance. Expected type `{type_}`, got `{type(obj)}`.")
-
-
-class ExpRunningAverage:
-    def __init__(self, new_contrib_rate: float):
-        self.new_contrib_rate = new_contrib_rate
-        self.running_average = None
-
-    def step(self, val):
-        if self.running_average is None:
-            self.running_average = val
-        else:
-            self.running_average = (self.new_contrib_rate * val + 
-                (1 - self.new_contrib_rate) * self.running_average)
-    
-        return self.running_average
-
-
-################################################################################
-# Dense Retriever Namespace
-################################################################################
-class DenseRetriever:
-    """Namespace with the functions used for dense retrieval with FAISS.
-    """
-    def __init__(self):
-        raise RuntimeError("Should never be instantiated.")
-
-    @classmethod
-    def create_index(cls, embeddings):
-        USE_SUBSET = None
-        if USE_SUBSET is not None:
-            print(f">> CAREFUL. Using subset {USE_SUBSET} / {len(embeddings)},"
-                  f" {USE_SUBSET/len(embeddings):0.2%}")
-            embeddings = embeddings[:USE_SUBSET]
-
-        DIM = embeddings.shape[1]
-        index = faiss.index_factory(DIM, FLAGS.faiss_index_factory,
-                                    faiss.METRIC_INNER_PRODUCT)
-
-        # index = faiss.IndexHNSWFlat(768, 128, faiss.METRIC_INNER_PRODUCT)
-        cls.index_init(index)
-
-        if FLAGS.faiss_use_gpu:
-            print("\t- Moving to gpu")
-            faiss_res = faiss.StandardGpuResources()
-            index = faiss.index_cpu_to_gpu(faiss_res, 0, index)
-        
-        print("\t- Training the index")
-        start = time.time()
-        index.train(embeddings)
-        print(f"\t- Training took "
-              f"{tqdm.tqdm.format_interval(time.time() - start)}")
-
-        print("\t- Adding the embeddings...")
-        start = time.time()
-        index.add(embeddings)
-        print(f"\t- Adding took "
-              f"{tqdm.tqdm.format_interval(time.time() - start)}")
-        
-        return index
-
-    @staticmethod
-    def search(index, queries, k):
-        # One should be careful about assigning to attributes in Python
-        assert hasattr(index, "nprobe") 
-        return index.search(queries, k)
-
-    @staticmethod
-    def index_init(index):
-        index.nprobe = 256
-        # index.hnsw.efsearch = 128
-        # index.hnsw.efConstruction = 200
-
-    @classmethod
-    def load_index(cls, path: Union[pathlib.Path, str]):
-        print("Loading FAISS index ...")
-        index_cpu = faiss.read_index(path)
-        cls.index_init(index_cpu)
-
-        print("Done loading FAISS index.")
-        if FLAGS.faiss_use_gpu:
-            print("Moving the DPR FAISS index to the GPU.")
-            faiss_res = faiss.StandardGpuResources()
-            index_gpu = faiss.index_cpu_to_gpu(faiss_res, 0, index_cpu)
-            print("Done moving the DPR FAISS index to the GPU.")
-            return index_gpu
-        else:
-            return index_cpu
-
-    @staticmethod
-    def save_index(index, path: Union[pathlib.Path, str]) -> None:
-        if FLAGS.faiss_use_gpu:
-            print("Moving the index to cpu")
-            index = faiss.index_gpu_to_cpu(index)
-        print("Saving the index")
-        faiss.write_index(index, path)
-        print("Done saving the index")
-    
-
-def embed_passages_for_retrieval(passages, tokenizer, qa_embedder, 
-                                 max_length=128, device="cuda:0"):
-    # Ref:
-    # https://github.com/huggingface/notebooks/blob/master/longform-qa/lfqa_utils.py
-
-    a_toks = tokenizer.batch_encode_plus(passages, max_length=max_length, 
-                                         pad_to_max_length=True)
-    a_ids, a_mask = (torch.LongTensor(a_toks["input_ids"]).to(device),
-                     torch.LongTensor(a_toks["attention_mask"]).to(device))    
-    pooled_output = qa_embedder(a_ids, a_mask)[0].detach()
-
-    return pooled_output.cpu().type(torch.float).numpy()
-
-
-def create_memmap(path, dataset,  num_embeddings, batch_size, np_index_dtype):
-    """Creates the mem-mapped array containing the embeddings for DPR wikipedia.
-
-    Modified from 
-    https://github.com/huggingface/notebooks/blob/master/longform-qa/lfqa_utils.py#L566    
-    """
-    print("Creating memmap.")
-    DPR_NUM_EMBEDDINGS = len(dataset)
-    print("\t- Creating memmap file...")
-    emb_memmap = np.memmap(path,
-                           dtype=np_index_dtype, mode="w+", 
-                           shape=(num_embeddings, FLAGS.dpr_embedding_depth))
-    n_batches = math.ceil(num_embeddings / batch_size)
-    avg_duration = ExpRunningAverage(0.1)
-
-    if FLAGS.create_dpr_embeddings:
-        print("Loading DPR question encoder tokenizer ...")
-        tokenizer = transformers.DPRContextEncoderTokenizer.from_pretrained(
-            "facebook/dpr-ctx_encoder-single-nq-base")
-        print("... Done loading DPR tokenizer.")
-        print("Loading DPR question encoder model ...")
-        model = transformers.DPRContextEncoder.from_pretrained(
-            "facebook/dpr-ctx_encoder-single-nq-base").cuda()
-
-    # Prepare the generator for the multiprocessing situation
-    def copy_embedding(i):
-        start = time.time()
-        emb_memmap = np.memmap(FLAGS.dpr_np_memmmap_path,
-                               dtype=DPR_EMB_DTYPE, mode="r+", 
-                               shape=(DPR_NUM_EMBEDDINGS, 
-                               FLAGS.dpr_embedding_depth))
-        if FLAGS.create_dpr_embeddings:
-            text = [p for p in dataset[i * batch_size : (i + 1) * batch_size][
-                    "text"]]
-            reps = embed_passages_for_retrieval(
-                text, tokenizer, model, MAX_LENGTH)
-        else:
-            reps = [p for p in dataset[i * batch_size : (i + 1) * batch_size][
-                    "embeddings"]]
-        emb_memmap[i * batch_size : (i + 1) * batch_size] = reps        
-        print(f"{i} / {n_batches} : took {time.time() - start:0f}s - "
-              f"writing to '{FLAGS.dpr_np_memmmap_path}'")
-        return i
-    
-    # Ref: https://stackoverflow.com/a/55423170/447599
-    print("\t- Starting Pool...")
-    duration_full_start = time.time()
-    with futures.ThreadPoolExecutor(FLAGS.nproc) as pool:
-        for _ in tqdm.tqdm(pool.map(copy_embedding, range(n_batches)), 
-                           total=n_batches):
-            pass
-    duration_full = time.time() - duration_full_start
-    tqdm.tqdm.write(f"Took: {tqdm.tqdm.format_interval(duration_full)}")
-
-    print("Done creating mmap.")
-
-
-def dpr_faiss_retrieve(faiss_index_dpr, 
-                       dpr_tokenizer: transformers.DPRQuestionEncoderTokenizer, 
-                       dpr_question_encoder: transformers.DPRQuestionEncoder, 
-                       question : str):
-    check_type(question, str)
-    check_type(dpr_tokenizer, transformers.DPRQuestionEncoderTokenizer)
-    check_type(dpr_question_encoder, transformers.DPRQuestionEncoder)
-
-    # Tokenize the question for the DPR encoder
-    dpr_tokenized = dpr_tokenizer(question, return_tensors="pt")
-    
-    # Run inference
-    dpr_embedding = dpr_question_encoder(**dpr_tokenized)[0]
-
-    # Run search with FAISS
-    distances, indices = faiss_index_dpr.search(dpr_embedding.detach().numpy(), 
-                                                DPR_K)
-
-    return indices[0]
 
 
 def bart_predict(bart_tokenizer: transformers.BartTokenizer, 
@@ -351,9 +117,9 @@ def bart_predict(bart_tokenizer: transformers.BartTokenizer,
                                             return_tensors="pt")
         sample_predictions = bart_model.generate(**tokenized_sample, 
             do_sample=True,
-            max_length=1024, 
+            max_length=MAX_LENGTH_PREDICTION, 
             num_return_sequences=N_GENERATIONS_PER_DISPLAY,
-            top_k=10)
+            top_k=PREDICTION_TOP_K_QUANTITY)
 
         for j in range(N_GENERATIONS_PER_DISPLAY):
             i_txt = click.style(str(i), fg="blue")
@@ -373,8 +139,18 @@ def main(unused_argv: List[str]) -> None:
     print_iterable(unused_argv)
     check(len(unused_argv) <= 1, str(unused_argv))
 
-    # Adjust the logging level
-    logging.set_verbosity(FLAGS.log_level)
+    # Adjust the root logging level
+    logging.basicConfig(level=logging.DEBUG, 
+        format="`%(levelname)s` - `%(name)s`: %(message)s")
+    # LOGGER.setLevel(logging.DEBUG)
+    # This formulation ensures that we are not accidentally creating 
+    # a new logger that has no effect, ie, it breaks if "nlp" doesn't
+    # already exist.
+    # assert "nlp" in logging.Logger.manager.loggerDict
+    # logging.getLogger("nlp").setLevel(FLAGS.log_level_hf_nlp)
+
+    def log_loading(message, color="blue"):
+        LOGGER.info(click.style(message, fg=color))
 
     # Argument checks
     if FLAGS.create_dpr_embeddings:
@@ -384,10 +160,15 @@ def main(unused_argv: List[str]) -> None:
         assert FLAGS.create_faiss_dpr
 
     # Load the snippets from wikipedia
-    print(f"Loading dataset 'wiki_dpr' with embeddings...")    
-    # wiki_dpr = nlp.load_dataset("wiki_dpr", "psgs_w100_no_embeddings")
+    log_loading(f"Loading dataset 'wiki_dpr' with embeddings...")    
     wiki_dpr = nlp.load_dataset("wiki_dpr", "psgs_w100_with_nq_embeddings")
-    print(f"Done loading dataset 'wiki_dpr'.")
+    # if FLAGS.create_np_memmap and FLAGS.create_dpr_embeddings:
+    #     print(f"Loading dataset 'wiki_dpr' with embeddings...")    
+    #     wiki_dpr = load.load_dataset("wiki_dpr", "psgs_w100_with_nq_embeddings")
+    # else:
+    #     print(f"Loading dataset 'wiki_dpr' without embeddings...")    
+    #     wiki_dpr = load.load_dataset("wiki_dpr", "psgs_w10na0_no_embeddings")
+    log_loading(f"Done loading dataset 'wiki_dpr'.", color="green")
 
 
     ############################################################################
@@ -428,47 +209,65 @@ def main(unused_argv: List[str]) -> None:
                                   FLAGS.dpr_embedding_depth))
 
         # Actually create the FAISS index.
-        print("\nCreating dpr faiss index ...")
+        log_loading("\nCreating dpr faiss index ...")
         faiss_index_dpr = DenseRetriever.create_index(dpr_np_memmap)
-        print("Done creating dpr faiss index.")
+        log_loading("Done creating dpr faiss index.", color="green")
 
         # Save it.
-        print("\nSaving dpr faiss index ...")
+        log_loading("\nSaving dpr faiss index ...")
         DenseRetriever.save_index(faiss_index_dpr, 
                                   FLAGS.dpr_faiss_path)
-        print("Done saving dpr faiss index.")
+        log_loading("Done saving dpr faiss index.", color="green")
         return
     else:
-
         faiss_index_dpr = DenseRetriever.load_index(
             FLAGS.dpr_faiss_path)
 
     ############################################################################
     # Load Questions & Search DPR
     ############################################################################
+    log_loading("Loading DPRQuestionEncoderTokenizer")
     dpr_tokenizer = transformers.DPRQuestionEncoderTokenizer.from_pretrained(
         "facebook/dpr-question_encoder-single-nq-base")
     
+    log_loading("Loading DPRQuestionEncoder")
     dpr_question_encoder = transformers.DPRQuestionEncoder.from_pretrained(
         "facebook/dpr-question_encoder-single-nq-base")
 
+    log_loading("Loading the ELI5 BART model tokenizer")
     bart_tokenizer = transformers.AutoTokenizer.from_pretrained(FLAGS.model)
+
+    log_loading("Loading the ELI5 BART model")
     bart_model = transformers.AutoModelForSeq2SeqLM.from_pretrained(
         FLAGS.model)
+    log_loading("Done loading models", color="green")
 
-    eli5 = nlp.load_dataset("eli5")
-
+    # Expected format:
+    # questions: Iterable[str] with one question per sample
+    # answers: Iterable[Optional[List[str]]] with a *list* of at least one answer
+    # indices: Iterable[Optional[int]] of the indices 
     if FLAGS.input_mode == "eli5":
-        ds = eli5["train_eli5"]
+        log_loading("Loading ELI5")
+        ds = nlp.load_dataset("eli5")["train_eli5"]
         questions = (ds[question_index]["title"].strip()
                      for question_index in QUESTION_INDICES)
         answers = (map(str.strip, ds[question_index]["answers"]["text"])
                    for question_index in QUESTION_INDICES)
         indices = QUESTION_INDICES
+        log_loading("Done Loading ELI5", color="green")
+    elif FLAGS.input_mode == "trivia_qa":
+        log_loading("Loading TriviaQA")
+        ds = nlp.load_dataset("trivia_qa", "rc")["train"]
+        questions = (ds[question_index]["question"].strip()
+                     for question_index in QUESTION_INDICES)
+        answers = ([ds[question_index]["answer"]["normalized_value"].strip()]
+                   for question_index in QUESTION_INDICES)
+        indices = QUESTION_INDICES
+        log_loading("Done Loading TriviaQA", color="green")
     elif FLAGS.input_mode == "cli":
         questions = [input("Please write a question: ").strip()]
-        answers = ["N/A"]
-        indices = ["N/A"]
+        answers = [[None]]
+        indices = [None]
     else:
         raise RuntimeError(f"Unsupported input_mode: {FLAGS.input_mode}")
 
@@ -478,9 +277,8 @@ def main(unused_argv: List[str]) -> None:
         """
         print(click.style(text, bold=True))
 
-    for question, answers, index in zip(questions, answers, indices):
+    for question, answers, index in zip_safe(questions, answers, indices):
         check_type(question, str)
-        # number_string = click.style(f"#{question_index}", fg="green")
         number_string = click.style(f"#{index}", fg="blue")
 
         print_title(f"Question {number_string}:")
@@ -489,17 +287,19 @@ def main(unused_argv: List[str]) -> None:
         print("")
 
         # Print the annotated anwers:
-        # print_title("\nLabels:")
-        # print_iterable(answers)
-        # print("")
+        print_title(f"Labels for {number_string}:")
+        print("")        
+        print_iterable(answers)
+        print("")
 
         # Retrieve contexts and print them:
         contexts = dpr_faiss_retrieve(faiss_index_dpr=faiss_index_dpr, 
                                       dpr_tokenizer=dpr_tokenizer, 
-                                      dpr_question_encoder=dpr_question_encoder, 
+                                      dpr_question_encoder=dpr_question_encoder 
                                       question=question)
         context_texts = [wiki_dpr["train"][int(context_index)]["text"] 
                          for context_index in contexts]
+
         print_title(f"Contexts for question {number_string}:")
         print("")
         print_numbered_iterable(context_texts)
@@ -526,12 +326,6 @@ def main(unused_argv: List[str]) -> None:
         print_iterable(formatted_answers)
         print("")
     return 
-
-
-    ############################################################################
-    # BART inference
-    ############################################################################
-    # Load the tokenizer    
 
 
 if __name__ == "__main__":

@@ -47,8 +47,9 @@ else
 fi
 if [[ ! -z $CREATE_FAISS_DPR ]] ; then
     EXTRA_ARGS="--create_faiss_dpr=True $EXTRA_ARGS"
+else
+    EXTRA_ARGS="--create_faiss_dpr=False $EXTRA_ARGS"
 fi
-
 
 ################################################################################
 # Checks
